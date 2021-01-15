@@ -7,3 +7,12 @@ meeting_notes
 pre-registration
 random
 website
+raw_data
+part_1/sumstats_readme.txt
+part_2/clean_data
+part_2/plots
+part_2/results
+*.tsv
+*.csv
+*.xlsx
+*.docx

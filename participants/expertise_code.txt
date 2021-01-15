@@ -1,0 +1,15 @@
+# coding the expertise of researchers
+# draft
+
+1 - master student
+2 - PhD student
+3 - Post-Doc
+4 - Professor
+
+or 
+
+coded by years of experience in relevant field
+
+or
+
+coded by relevant published studies
