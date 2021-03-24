@@ -9,6 +9,8 @@ random
 website
 raw_data
 part_1/sumstats_readme.txt
+part_1/data
+part_1/scripts/GenGen-1.0.1
 part_2/clean_data
 part_2/plots
 part_2/results
@@ -16,3 +18,4 @@ part_2/results
 *.csv
 *.xlsx
 *.docx
+*.log

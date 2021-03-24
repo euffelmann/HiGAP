@@ -1,0 +1,284 @@
+---
+title: "qc"
+author: "Emil Uffelmann"
+date: "10/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r set-up}
+library(data.table)
+```
+
+
+##### script to clean raw genotyping files
+
+information on sex is missing in the plink files. I will add sex info myself from the phenotype file.
+
+```{r get sex info}
+pheno <- fread("../raw_data/phenoGenotypeFiles/PhenotypeFiles/phs000607.v3.pht003445.v3.p2.c1.Neurodevelopmental_Genomics_Subject_Phenotypes.GRU-NPU.txt.gz",
+              skip = 10)
+length(unique(pheno$dbGaP_Subject_ID)) # 9496
+pheno_clean <- pheno[!(pheno$INT_NUM == 1 & pheno$SUBJID %in% pheno$SUBJID[duplicated(pheno$SUBJID)])]
+
+sex <- pheno_clean[,c("SUBJID", "Sex")]
+sex$codedsex[sex$Sex == "M"] <- 1
+sex$codedsex[sex$Sex == "F"] <- 2
+
+sex$FID <- 0
+sex <- sex[,c(4,1,3)]
+
+fwrite(sex, "../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed_sex.txt", quote=F, row.names=F, col.names = F, sep=" ", na = 0)
+```
+
+```{bash individuals with discordant sex information}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+plink --bfile GO_Quad_5removed --update-sex  GO_Quad_5removed_sex.txt --check-sex --out GO_Quad_5removed
+
+grep PROBLEM GO_Quad_5removed.sexcheck > GO_Quad_5removed.sexprobs 
+
+# copy FIDs and IIDs of individuals where sexcheck failed to another file
+awk '{print $1,$2}' GO_Quad_5removed.sexprobs > fail-sexcheck-qc.txt
+```
+
+```{bash individuals with elevated missing data rates or outlying heterozygosity rate}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+plink --bfile GO_Quad_5removed --missing --out GO_Quad_5removed
+
+plink --bfile GO_Quad_5removed --het --out GO_Quad_5removed
+
+echo "FID IID obs_HOM N_SNPs prop_HET" > het.txt 
+awk 'NR>1{print $1,$2,$3,$5,($5-$3)/$5}' GO_Quad_5removed.het >> het.txt
+
+awk 'NR==FNR{a[$1,$2]=$5;next}($1,$2) in a{print $1,$2,$6,a[$1,$2]}' het.txt GO_Quad_5removed.imiss > het.imiss.txt 
+```
+
+plotting observed heterozygosity rate per individual on the x axis and the proportion of missing SNPs per individuals plotted on the y axis
+```{r plot heterozygosity rate per individual}
+het <- read.table("../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/het.imiss.txt", head=TRUE)
+names(het)
+hist(het$prop_HET, xlab="Heterozygosity rate", ylab="Frequency", main="")
+
+# Sample call rate / individuals missing genotyped data
+hist(het$F_MISS,xlab="Proportion of individuals missing SNPs", main ='Sample Call Rate') 
+
+# Check how many individuals have a call rate less tha .95 (or 5% missing genotype data)
+length(which(het$F_MISS>.05))
+
+# Plot heterozygosity by individual missingness. With Plink we'll remove individuals with >5% missingness and heterozygosity rate outside +/- 3 SD. 
+plot(het$F_MISS,het$prop_HET,xlab="Individual missingness", ylab="Heterozygosity rate")
+abline(v=.05,col="red")
+mean(het$prop_HET)
+sd(het$prop_HET)
+mean(het$prop_HET)-3*sd(het$prop_HET)
+mean(het$prop_HET)+3*sd(het$prop_HET)
+abline(h=c(mean(het$prop_HET)-3*sd(het$prop_HET),mean(het$prop_HET)+3*sd(het$prop_HET)),col="blue")
+
+plot(het$F_MISS,het$prop_HET,xlab="Individual missingness", ylab="Heterozygosity rate",
+     xlim = c(0, 0.1))
+abline(v=.05,col="red")
+mean(het$prop_HET)
+sd(het$prop_HET)
+mean(het$prop_HET)-3*sd(het$prop_HET)
+mean(het$prop_HET)+3*sd(het$prop_HET)
+abline(h=c(mean(het$prop_HET)-3*sd(het$prop_HET),mean(het$prop_HET)+3*sd(het$prop_HET)),col="blue")
+```
+
+```{r exclude individuals with excessive missingness and heterozygosity}
+length(which(het$F_MISS > 0.05 | abs(scale(het$prop_HET)) > 3)) # 192 individuals have more than 95% missing data
+het$z_prop_HET <- abs(scale(het$prop_HET))
+fail_imisshet_qc <- het[het$F_MISS > 0.05 | het$z_prop_HET > 3, c(1,2)]
+fwrite(fail_imisshet_qc, "../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/fail_imisshet_qc.txt", quote=F, row.names=F, col.names = F, sep=" ", na = 0)
+```
+
+##### Identification of duplicated or related individuals
+First, data will be pruned to make subsequent IBS calculation faster
+```{bash pruning data}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+plink --bfile GO_Quad_5removed --exclude ../../../../data/qc/highld_regions.txt --range --indep-pairwise 50 5 0.2 --out GO_Quad_5removed
+```
+
+```{bash pairwise IBS for all pairs of individuals}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+plink --bfile GO_Quad_5removed --extract GO_Quad_5removed.prune.in --genome --out GO_Quad_5removed
+```
+
+```{bash identify all pairs of individuals with an IBD > 0.185}
+perl run-IBD-QC.pl ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed
+
+mv fail-IBD-QC.txt ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+```
+
+merging data base data and 1000G
+```{bash Identification of individuals of divergent ancestry}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+plink --bfile ../../../../data/qc/1000G --bmerge GO_Quad_5removed --extract GO_Quad_5removed.prune.in --make-bed --out GO_Quad_5removed_1000G_pruned
+```
+I got errors
+
+##### fixing strand issues
+Upon inspection I realized that the the dbGaP data is on genomic build GRCh36 and 1000G on GRCh37. Also, the dbGaP data has a different allele coding scheme (Illumina 1/2 coding). This website has useful information to update the build: https://www.well.ox.ac.uk/~wrayner/strand/index.html
+
+```{bash update build}
+./update_build.sh ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed /Users/schneemil/Desktop/Human610-Quadv1_B-b37-strand/Human610-Quadv1_B-b37.strand ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed_b37
+```
+
+convert allele coding from illumina 1/2 to dbSNP
+see https://gengen.openbioinformatics.org/en/latest/tutorial/coding/
+```{bash convert allele coding}
+GenGen-1.0.1/convert_bim_allele.pl ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed_b37.bim ../data/qc/hh610v1_snptable.txt -intype ilmn12 -outtype dbsnp -outfile ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed_b37_actg.bim
+```
+
+Now I will repeat the merging
+```{bash repeat merge}
+cd /Users/schneemil/Documents/CTG/projects/HiGAP/part_1/raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU
+
+ln -s GO_Quad_5removed_b37.bed GO_Quad_5removed_b37_actg.bed
+ln -s GO_Quad_5removed_b37.fam GO_Quad_5removed_b37_actg.fam
+
+plink --bfile GO_Quad_5removed_b37_actg --bmerge ../../../../data/qc/1000G --extract GO_Quad_5removed.prune.in --make-bed --out GO_Quad_5removed_b37_actg_1000G_pruned
+```
+71228 variants cannot be merged, probably because of strand issues. 
+Here is a work-around: https://www.cog-genomics.org/plink2/data#merge3
+
+```{bash correct the strand issues}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+#flip strands for SNPs that cannot be  merged
+plink --bfile GO_Quad_5removed_b37_actg --flip GO_Quad_5removed_b37_actg_1000G_pruned-merge.missnp --make-bed --out GO_Quad_5removed_b37_actg_trial
+
+#merge again
+plink --bfile GO_Quad_5removed_b37_actg_trial --bmerge ../../../../data/qc/1000G --extract GO_Quad_5removed.prune.in --make-bed --out merged_trial
+
+#flip those that couldn't be merged again
+plink --bfile GO_Quad_5removed_b37_actg_trial --flip merged_trial-merge.missnp --make-bed --out GO_Quad_5removed_b37_actg_trial_corrected
+
+#and merge once again
+plink --bfile GO_Quad_5removed_b37_actg_trial_corrected --bmerge ../../../../data/qc/1000G --extract GO_Quad_5removed.prune.in --make-bed --out merged_trial2
+```
+there are still issues with some SNPs. These need to be removed.
+
+```{bash exclude SNPs}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+plink --bfile GO_Quad_5removed_b37_actg_trial_corrected --exclude merged_trial2-merge.missnp --make-bed --out tmp_GO_Quad
+
+plink --bfile ../../../../data/qc/1000G --exclude merged_trial2-merge.missnp --make-bed --out tmp_1000G
+
+plink --bfile tmp_GO_Quad --bmerge tmp_1000G --extract GO_Quad_5removed.prune.in --make-bed --out GO_Quad_5removed_1000G_pruned_final
+
+rm tmp*
+```
+
+
+##### PCA
+```{bash PCA}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+#plink --bfile GO_Quad_5removed_1000G_pruned_final --genome --out GO_Quad_5removed_1000G_pruned_final
+#
+#plink --bfile GO_Quad_5removed_1000G_pruned_final --cluster --mds-plot 20 --out #GO_Quad_5removed_1000G_pruned_final_mds
+
+# assign individuals to ancestry group
+grep -i 'mis_pop_afri*' GO_Quad_5removed_1000G_pruned_final_mds.mds > AF
+awk '{print $1, $2, 1, $4, $5}' AF > AF_2
+grep -i 'mis_pop_amer*' GO_Quad_5removed_1000G_pruned_final_mds.mds > AM
+awk '{print $1, $2, 2, $4, $5}' AM > AM_2
+grep -i 'mis_pop_asia*' GO_Quad_5removed_1000G_pruned_final_mds.mds > AS
+awk '{print $1, $2, 3, $4, $5}' AS > AS_2
+grep -i 'mis_pop_euro*' GO_Quad_5removed_1000G_pruned_final_mds.mds > EU
+awk '{print $1, $2, 4, $4, $5}' EU > EU_2
+awk -v val='0' '$1 == val' GO_Quad_5removed_1000G_pruned_final_mds.mds > dbgap
+awk '{print $1, $2, 5, $4, $5}' dbgap > dbgap_2
+cat AF_2 AM_2 AS_2 EU_2 dbgap_2 > GO_Quad_5removed_1000G_pruned_final_mds_2.mds
+
+```
+
+```{r plot PCA}
+data=read.table("../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed_1000G_pruned_final_mds_2.mds",h=F)
+# subset based on ancestry
+AFRICAN=which(data$V3=="1")
+AMERICAN=which(data$V3=="2")
+ASIAN=which(data$V3=="3")
+EUROPEAN=which(data$V3=="4")
+dbgap=which(data$V3=="5")
+# xlim = min and max PC1, ylim = min and max PC2
+plot(0,0,pch="",xlim=c(-0.12,0.135),ylim=c(-0.07,0.195),xlab="principal component 1", ylab="principal component 2",cex.axis=1,cex.lab=1)
+# give each ancestry group a different colour
+points(data$V4[AFRICAN],data$V5[AFRICAN],pch=20,col="RED", cex=1)
+points(data$V4[AMERICAN],data$V5[AMERICAN],pch=20,col="BLUE",cex=1)
+points(data$V4[ASIAN],data$V5[ASIAN],pch=20,col="GREEN",cex=1)
+points(data$V4[EUROPEAN],data$V5[EUROPEAN],pch=20,col="YELLOW",cex=1)
+points(data$V4[dbgap],data$V5[dbgap],pch=20,col="PINK",cex=1)
+# add legend
+legend("bottomleft", pch=c(20,20), col=c("RED","BLUE","GREEN","YELLOW","PINK"), c("African", "American","Asian","European","dbgap"), bty="o", box.col="black", cex = 1.0) 
+```
+Looks like like the genotyping array causes the dbgap individuals to be separated. Now I will check how this looks if I pre-select based on race (for EA - European Americans)
+
+```{r get subject IDs of EA individuals}
+pheno <- fread("../raw_data/phenoGenotypeFiles/PhenotypeFiles/phs000607.v3.pht003445.v3.p2.c1.Neurodevelopmental_Genomics_Subject_Phenotypes.GRU-NPU.txt.gz",
+              skip = 10)
+
+length(unique(pheno$dbGaP_Subject_ID)) # 9496
+pheno_clean <- pheno[!(pheno$INT_NUM == 1 & pheno$SUBJID %in% pheno$SUBJID[duplicated(pheno$SUBJID)])]
+
+nonEA <- pheno_clean$SUBJID[pheno_clean$Race != "EA"]
+
+data=read.table("../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/GO_Quad_5removed_1000G_pruned_final_mds_2.mds",h=F)
+
+#exclude nonEA individuals
+`%notin%` <- Negate(`%in%`)
+data$V2 <- as.character(data$V2)
+nonEA <- as.character(nonEA)
+data_nonEA <- data[data$V2 %notin% nonEA,]
+
+# subset based on ancestry
+AFRICAN=which(data_nonEA$V3=="1")
+AMERICAN=which(data_nonEA$V3=="2")
+ASIAN=which(data_nonEA$V3=="3")
+EUROPEAN=which(data_nonEA$V3=="4")
+dbgap=which(data_nonEA$V3=="5")
+# xlim = min and max PC1, ylim = min and max PC2
+plot(0,0,pch="",xlim=c(-0.12,0.135),ylim=c(-0.07,0.195),xlab="principal component 1", ylab="principal component 2",cex.axis=1,cex.lab=1)
+abline(v=-.015,col="red") # I set this threshold by eye-balling the plot below
+# give each ancestry group a different colour
+points(data_nonEA$V4[AFRICAN],data_nonEA$V5[AFRICAN],pch=20,col="RED", cex=1)
+points(data_nonEA$V4[AMERICAN],data_nonEA$V5[AMERICAN],pch=20,col="BLUE",cex=1)
+points(data_nonEA$V4[ASIAN],data_nonEA$V5[ASIAN],pch=20,col="GREEN",cex=1)
+points(data_nonEA$V4[EUROPEAN],data_nonEA$V5[EUROPEAN],pch=20,col="YELLOW",cex=1)
+points(data_nonEA$V4[dbgap],data_nonEA$V5[dbgap],pch=20,col="PINK",cex=1)
+# add legend
+legend("bottomleft", pch=c(20,20), col=c("RED","BLUE","GREEN","YELLOW","PINK"), c("African", "American","Asian","European","dbgap"), bty="o", box.col="black", cex = 1.0) 
+
+```
+
+write file with FIDs and IIDs of subjects to be excluded
+```{r fail-ancestry-QC.txt}
+fail_ancestry_QC <- data_nonEA$V2[data_nonEA$V3 == "5" & data_nonEA$V4 < -.015] # individuals with lower values of PC2 seem to be too close to African Americans (AA)
+
+nonEA_exclude <- nonEA[nonEA %in% data$V2]
+fail_ancestry_QC <- append(fail_ancestry_QC, nonEA_exclude)
+
+fail_ancestry_QC_df <- data_frame(fail_ancestry_QC)
+fail_ancestry_QC_df$fid <- 0
+fail_ancestry_QC_df <- fail_ancestry_QC_df[,c(2,1)]
+
+fwrite(fail_ancestry_QC_df, "../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/fail-ancestry-QC-nonEA.txt", quote=F, row.names=F, col.names = F, sep=" ", na = 0)
+```
+
+```{bash remove individuals who failed QC}
+cd ../raw_data/phenoGenotypeFiles/GenotypeFiles/phg000381.v2.NIMH_NeurodevelopmentalGenomics.genotype-calls-matrixfmt.Human610-Quadv1_B.c1.GRU-NPU/
+
+cat fail-* | sort -k1 | uniq > fail-qc-inds.txt
+
+plink --bfile GO_Quad_5removed_b37_actg --remove fail-qc-inds.txt --make-bed --out /Users/schneemil/Documents/CTG/projects/HiGAP/part_1/data/clean/GO_Quad_5removed/clean_EA_GO_Quad_5removed
+```
+

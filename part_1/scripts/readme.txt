@@ -1,0 +1,1 @@
+- update_build.sh: downloaded from here to update build of binary plink files: https://www.well.ox.ac.uk/~wrayner/strand/index.html
